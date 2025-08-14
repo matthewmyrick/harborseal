@@ -35,7 +35,7 @@ def aead_decrypt(key: bytes, data: bytes, aad: bytes = b"") -> bytes:
     return aes.decrypt(nonce, ct, aad)
 
 def get_cfg():
-    return load_json(CONF_DIR / "config.json", default={"server_url": "https://api.harborseal.com", "device": {}, "stores": {}})
+    return load_json(CONF_DIR / "config.json", default={"server_url": "", "device": {}, "stores": {}})
 
 def save_cfg(cfg): save_json(CONF_DIR / "config.json", cfg)
 
@@ -76,9 +76,18 @@ def init():
     # Get secret store name first
     store_name = typer.prompt("Secret store name")
     
+    # Check if server URL is configured
+    server_url = cfg["server_url"]
+    if not server_url:
+        typer.echo("❌ Server URL is not configured.")
+        typer.echo("Please set the server URL first using:")
+        typer.echo("  harborseal config --url <your-server-url>")
+        typer.echo("\nExample:")
+        typer.echo("  harborseal config --url https://api.harborseal.com")
+        raise typer.Exit(1)
+    
     # Auto-generate device ID
     device_id = generate_device_id()
-    server_url = cfg["server_url"]  # Use default from config
     
     typer.echo(f"Device ID: {device_id}")
     typer.echo(f"Server URL: {server_url}")
