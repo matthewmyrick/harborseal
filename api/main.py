@@ -27,8 +27,14 @@ DB["users"][DEMO_USER_ID] = {"email": "demo@example.com", "devices": [], "stores
 DB["api_keys"]["demo-api-key"] = DEMO_USER_ID
 
 # ---- Models ----
+class ApiKeyRequest(BaseModel):
+    device_id: str
+
+class ApiKeyResponse(BaseModel):
+    api_key: str
+
 class RegisterDeviceRequest(BaseModel):
-    name: str
+    device_id: str
     public_key_b64: str  # Curve25519 public key (32 bytes) Base64
 
 class RegisterDeviceResponse(BaseModel):
@@ -96,6 +102,15 @@ def issue_device_jwt(user_id: str, device_id: str) -> str:
 # ---- App ----
 app = FastAPI(title="MyStash KMS-lite")
 
+@app.post("/apiKey", response_model=ApiKeyResponse)
+def get_api_key(req: ApiKeyRequest):
+    """Generate an API key for device registration - allows automatic device onboarding."""
+    # For demo purposes, we'll associate the device_id with the demo user
+    # In production, this might involve additional verification or user association logic
+    api_key = f"auto-{secrets.token_hex(16)}"
+    DB["api_keys"][api_key] = DEMO_USER_ID
+    return ApiKeyResponse(api_key=api_key)
+
 @app.post("/devices/register", response_model=RegisterDeviceResponse)
 def register_device(req: RegisterDeviceRequest, user_id: str = Depends(require_user)):
     # Validate public key
@@ -104,10 +119,16 @@ def register_device(req: RegisterDeviceRequest, user_id: str = Depends(require_u
     except Exception:
         raise HTTPException(400, "Invalid public key")
 
-    device_id = f"d_{secrets.token_hex(8)}"
+    # Use the provided device_id instead of generating one
+    device_id = req.device_id
+    
+    # Check if device already exists
+    if device_id in DB["devices"]:
+        raise HTTPException(400, f"Device ID {device_id} already exists")
+    
     DB["devices"][device_id] = {
         "user_id": user_id,
-        "name": req.name,
+        "device_id": device_id,  # Store the device_id as name
         "pubkey_b64": req.public_key_b64,
     }
     DB["users"][user_id]["devices"].append(device_id)
