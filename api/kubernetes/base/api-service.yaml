@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: harborseal-api
+  namespace: harborseal
+spec:
+  selector:
+    app.kubernetes.io/name: harborseal
+    app.kubernetes.io/component: api
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  type: ClusterIP

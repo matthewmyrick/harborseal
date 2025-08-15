@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: harborseal-api
+  labels:
+    app: harborseal-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: harborseal-api
+  template:
+    metadata:
+      labels:
+        app: harborseal-api
+    spec:
+      containers:
+      - name: harborseal-api
+        image: harborseal-api:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: MONGODB_URL
+          value: "mongodb://mongodb:27017"
+        - name: DATABASE_NAME
+          value: "harborseal"
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: harborseal-secrets
+              key: jwt-secret
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: harborseal-api-service
+spec:
+  selector:
+    app: harborseal-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: LoadBalancer
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: harborseal-secrets
+type: Opaque
+data:
+  # Base64 encoded JWT secret - replace with your own secure secret
+  jwt-secret: aGFyYm9yc2VhbC1qd3Qtc2VjcmV0LWNoYW5nZS1tZQ==  # "harborseal-jwt-secret-change-me"

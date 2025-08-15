@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: harborseal-api-base
+
+resources:
+  - namespace.yaml
+  - mongodb-deployment.yaml
+  - mongodb-service.yaml
+  - mongodb-pvc.yaml
+  - api-deployment.yaml
+  - api-service.yaml
+  - external-secret.yaml
+
+commonLabels:
+  app.kubernetes.io/name: harborseal
+  app.kubernetes.io/component: api

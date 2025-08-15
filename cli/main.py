@@ -1,9 +1,10 @@
 # cli.py
 import os, json, base64, getpass, pathlib, requests, secrets
 import typer
-from typing import Optional
+from typing import Optional, List
 from nacl.public import PrivateKey, PublicKey, SealedBox
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fuzzywuzzy import fuzz, process
 
 app = typer.Typer(help="HarborSeal CLI")
 
@@ -148,31 +149,11 @@ def init():
         save_cfg(cfg)
         typer.echo(f"✓ Created secret store '{store['name']}'")
         
-        # Fetch and cache the DEK
-        r = requests.get(f"{server_url}/stores/{store['store_id']}/wrapped_key", headers=headers, timeout=10)
-        r.raise_for_status()
-        wrapped_b64 = r.json()["wrapped_dek_b64"]
-        
-        # Unwrap and cache DEK
-        sealed = SealedBox(sk)
-        dek = sealed.decrypt(b64dec(wrapped_b64))
-        
-        # Create filekey if doesn't exist
-        filekey_path = CONF_DIR / "filekey.bin"
-        if not filekey_path.exists():
-            _write(filekey_path, os.urandom(32))
-        filekey = _read(filekey_path)
-        
-        # Cache the DEK
-        dek_cache_path = CONF_DIR / f"{store_name}.dek"
-        blob = aead_encrypt(filekey, dek)
-        _write(dek_cache_path, blob)
-        
-        # Initialize empty store file
+        # Initialize empty store file (no DEK caching)
         empty_store = {}
-        store_blob = aead_encrypt(dek, json.dumps(empty_store, indent=2).encode())
         store_file_path = CONF_DIR / f"{store_name}.json.enc"
-        _write(store_file_path, store_blob)
+        # Create empty encrypted file - will be populated when first used
+        _write(store_file_path, b"")
         
         typer.echo(f"✓ Local secret store ready at {store_file_path}")
         typer.echo(f"\n✅ Setup complete! You can now use commands like:")
@@ -226,42 +207,80 @@ def create_store(name: str = typer.Option(...),):
     typer.echo(f"Created store {store['name']} ({store['store_id']}).")
 
 @app.command()
-def pull_key(store: str = typer.Option(..., help="Store name")):
-    """Fetch wrapped DEK for this device and cache it locally (encrypted under device key)."""
+def refresh(store: Optional[str] = typer.Option(None, help="Store name to test access")):
+    """Test JWT validity and server connectivity."""
     cfg = get_cfg()
-    server = cfg["server_url"]; dev = cfg.get("device")
-    info = cfg["stores"].get(store)
-    if not info: raise typer.Exit("Unknown store. Create or add it first.")
-    store_id = info["id"]
-
-    # Fetch wrapped DEK
-    headers = {"Authorization": f"DeviceJWT {dev['jwt']}"}
-    r = requests.get(f"{server}/stores/{store_id}/wrapped_key", headers=headers, timeout=10)
-    r.raise_for_status()
-    wrapped_b64 = r.json()["wrapped_dek_b64"]
-
-    # Unwrap locally with private key
-    sk = load_private_key(cfg["device"]["device_id"])
-    sealed = SealedBox(sk)
-    dek = sealed.decrypt(b64dec(wrapped_b64))  # 32 bytes
-
-    # Cache DEK: encrypt under device private key-derived box? Simpler: store in memory only.
-    # For demo, store DEK encrypted with a machine-local key file:
-    dek_cache_path = CONF_DIR / f"{store}.dek"
-    # Derive a file key (random) once:
-    filekey_path = CONF_DIR / "filekey.bin"
-    if not filekey_path.exists():
-        _write(filekey_path, os.urandom(32))
-    filekey = _read(filekey_path)
-    blob = aead_encrypt(filekey, dek)
-    _write(dek_cache_path, blob)
-    typer.echo(f"Cached DEK at {dek_cache_path} (sealed).")
+    if not cfg.get("device"):
+        typer.echo("❌ Device not initialized. Run 'harborseal init' first.")
+        return
+    
+    if store:
+        try:
+            # Test by attempting to load DEK
+            _load_dek(store)
+            typer.echo(f"✅ Successfully connected to store '{store}'")
+        except SystemExit:
+            typer.echo(f"❌ Failed to access store '{store}' - JWT may be expired")
+    else:
+        # Test basic JWT validity
+        try:
+            import jwt as jwt_lib
+            device_jwt = cfg["device"]["jwt"]
+            # Decode without verification to check expiration
+            payload = jwt_lib.decode(device_jwt, options={"verify_signature": False})
+            import time
+            exp_time = payload.get("exp", 0)
+            current_time = int(time.time())
+            
+            if exp_time > current_time:
+                remaining = exp_time - current_time
+                typer.echo(f"✅ JWT valid for {remaining // 60} more minutes")
+            else:
+                typer.echo("❌ JWT expired. Run 'harborseal init' to re-authenticate.")
+        except Exception as e:
+            typer.echo(f"❌ JWT validation failed: {e}")
 
 def _load_dek(store: str) -> bytes:
-    # In a real design, you would prefer OS keychain / TPM / age key; here: AES-GCM sealed cache.
-    filekey = _read(CONF_DIR / "filekey.bin")
-    blob = _read(CONF_DIR / f"{store}.dek")
-    return aead_decrypt(filekey, blob)
+    """Fetch DEK from server using JWT - no local caching for security."""
+    cfg = get_cfg()
+    server_url = cfg["server_url"]
+    device = cfg.get("device")
+    
+    if not device or not device.get("jwt"):
+        raise typer.Exit("Device not initialized. Run 'harborseal init' first.")
+    
+    store_info = cfg["stores"].get(store)
+    if not store_info:
+        raise typer.Exit(f"Unknown store '{store}'. Available stores: {list(cfg['stores'].keys())}")
+    
+    store_id = store_info["id"]
+    device_id = device["device_id"]
+    
+    # Fetch wrapped DEK from server using JWT
+    try:
+        headers = {"Authorization": f"DeviceJWT {device['jwt']}"}
+        r = requests.get(f"{server_url}/stores/{store_id}/wrapped_key", headers=headers, timeout=10)
+        r.raise_for_status()
+        wrapped_b64 = r.json()["wrapped_dek_b64"]
+        
+        # Unwrap DEK using device private key
+        sk = load_private_key(device_id)
+        sealed = SealedBox(sk)
+        dek = sealed.decrypt(b64dec(wrapped_b64))
+        
+        return dek
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401:
+            # JWT expired - need to re-authenticate
+            typer.echo("Authentication expired. Please run 'harborseal init' to re-authenticate.")
+            raise typer.Exit(1)
+        else:
+            typer.echo(f"Failed to fetch encryption key: {e}")
+            raise typer.Exit(1)
+    except Exception as e:
+        typer.echo(f"Failed to decrypt store key: {e}")
+        raise typer.Exit(1)
 
 def _store_path(store: str) -> pathlib.Path:
     cfg = get_cfg()
@@ -271,10 +290,20 @@ def _store_path(store: str) -> pathlib.Path:
 
 def _read_store(store: str) -> dict:
     path = _store_path(store)
-    if not path.exists(): return {}
+    if not path.exists():
+        return {}
+    
+    # Check if file is empty (newly created)
+    if path.stat().st_size == 0:
+        return {}
+    
     dek = _load_dek(store)
-    plaintext = aead_decrypt(dek, _read(path))
-    return json.loads(plaintext)
+    try:
+        plaintext = aead_decrypt(dek, _read(path))
+        return json.loads(plaintext)
+    except Exception:
+        # If decryption fails, might be empty file or corrupted - start fresh
+        return {}
 
 def _write_store(store: str, data: dict):
     path = _store_path(store)
@@ -306,6 +335,99 @@ def list(store: str = typer.Option(...)):
     data = _read_store(store)
     for k in sorted(data.keys()):
         print(k)
+
+@app.command()
+def find(store: str = typer.Option(...), query: str = typer.Option(...), limit: int = typer.Option(10, help="Max results to show")):
+    """Fuzzy search for keys in the store."""
+    data = _read_store(store)
+    if not data:
+        typer.echo("Store is empty")
+        return
+    
+    # Get all keys
+    all_keys = list(data.keys())
+    
+    # Perform fuzzy search
+    matches = process.extract(query, all_keys, limit=limit, scorer=fuzz.partial_ratio)
+    
+    if not matches:
+        typer.echo(f"No matches found for '{query}'")
+        return
+    
+    typer.echo(f"Found {len(matches)} matches for '{query}':")
+    for key, score in matches:
+        typer.echo(f"  {score:3d}% - {key}")
+
+@app.command()
+def search(store: str = typer.Option(...), query: str = typer.Option(...), interactive: bool = typer.Option(False, help="Interactive selection")):
+    """Search and optionally get a key value interactively."""
+    data = _read_store(store)
+    if not data:
+        typer.echo("Store is empty")
+        return
+    
+    # Get all keys
+    all_keys = list(data.keys())
+    
+    # Perform fuzzy search
+    matches = process.extract(query, all_keys, limit=20, scorer=fuzz.partial_ratio)
+    
+    if not matches:
+        typer.echo(f"No matches found for '{query}'")
+        return
+    
+    if not interactive:
+        # Just show the results
+        typer.echo(f"Found {len(matches)} matches for '{query}':")
+        for key, score in matches:
+            typer.echo(f"  {score:3d}% - {key}")
+        return
+    
+    # Interactive mode - let user select
+    typer.echo(f"Found {len(matches)} matches for '{query}':")
+    for i, (key, score) in enumerate(matches):
+        typer.echo(f"  {i+1:2d}. {score:3d}% - {key}")
+    
+    while True:
+        try:
+            choice = typer.prompt("\nSelect a key (number), or 'q' to quit")
+            if choice.lower() == 'q':
+                return
+            
+            idx = int(choice) - 1
+            if 0 <= idx < len(matches):
+                selected_key = matches[idx][0]
+                value = data[selected_key]
+                
+                # Ask what to do with the value
+                action = typer.prompt(f"Key: {selected_key}\nActions: (v)iew, (c)opy to clipboard, (e)xport format", default="v")
+                
+                if action.lower() == 'v':
+                    typer.echo(f"\nValue: {value}")
+                elif action.lower() == 'c':
+                    try:
+                        import subprocess
+                        subprocess.run(['pbcopy'], input=value.encode(), check=True)
+                        typer.echo("✓ Copied to clipboard")
+                    except Exception as e:
+                        typer.echo(f"Failed to copy to clipboard: {e}")
+                        typer.echo(f"Value: {value}")
+                elif action.lower() == 'e':
+                    typer.echo(f"{selected_key}={value}")
+                else:
+                    typer.echo(f"Value: {value}")
+                
+                if typer.confirm("\nSearch again?", default=False):
+                    continue
+                else:
+                    break
+            else:
+                typer.echo("Invalid selection")
+        except ValueError:
+            typer.echo("Please enter a valid number or 'q' to quit")
+        except KeyboardInterrupt:
+            typer.echo("\nExiting...")
+            break
 
 if __name__ == "__main__":
     app()

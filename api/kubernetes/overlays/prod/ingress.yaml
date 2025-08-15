@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: harborseal-api-ingress
+  namespace: harborseal
+  annotations:
+    kubernetes.io/ingress.class: "traefik"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    traefik.ingress.kubernetes.io/router.middlewares: "default-secure-headers@kubernetescrd"
+spec:
+  tls:
+  - hosts:
+    - api.harborseal.yourdomain.com
+    secretName: harborseal-api-tls
+  rules:
+  - host: api.harborseal.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: harborseal-api
+            port:
+              number: 80
